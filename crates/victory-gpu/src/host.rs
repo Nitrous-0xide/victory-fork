@@ -5970,6 +5970,14 @@ impl Meter {
                     at(100)
                 );
             }
+            {
+                let [looked, refreshed, staged] = [0, 1, 2].map(|i| {
+                    crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames
+                });
+                tracing::info!(
+                    "heap buffer pass per frame: {looked:.1} ms looking at views and spans, {refreshed:.1} ms refreshing copies, {staged:.1} ms staging textures"
+                );
+            }
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
