@@ -1245,6 +1245,54 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+fn mesh_counts_that_fit(
+    mut mesh: super::shader::Mesh,
+    threads: u32,
+    outputs: &[SigElement],
+    prims: &[SigElement],
+    strict: bool,
+) -> Result<super::shader::Mesh, Why> {
+    use super::container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
+
+    let fits = |m: super::shader::Mesh| {
+        mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
+    };
+    if fits(mesh) {
+        return Ok(mesh);
+    }
+    mesh.max_vertices = mesh.max_vertices.min(threads);
+    mesh.max_primitives = mesh.max_primitives.min(threads);
+    if fits(mesh) {
+        return Ok(mesh);
+    }
+    if strict {
+        return Err("a mesh shader whose outputs pass the host's 32 KiB");
+    }
+
+    let vertex_components = outputs.iter().map(|e| u64::from(e.cols)).sum::<u64>();
+    let primitive_components = prims.iter().map(|e| u64::from(e.cols)).sum::<u64>();
+    // D3D12 rejects a mesh pipeline whose declared maxima exceed 32 KiB.
+    // Keep the larger output stream, rounded down by one wave, until it fits.
+    // This is a coverage fallback: trailing vertices/primitives can be lost
+    // for groups whose real allocation request exceeds the reduced maximum.
+    while !fits(mesh) {
+        let vertex_bytes =
+            vertex_components * u64::from(mesh.max_vertices.next_multiple_of(32));
+        let primitive_bytes =
+            primitive_components * u64::from(mesh.max_primitives.next_multiple_of(32));
+        if vertex_bytes >= primitive_bytes && mesh.max_vertices > 32 {
+            mesh.max_vertices = ((mesh.max_vertices - 1) / 32) * 32;
+        } else if mesh.max_primitives > 32 {
+            mesh.max_primitives = ((mesh.max_primitives - 1) / 32) * 32;
+        } else if mesh.max_vertices > 32 {
+            mesh.max_vertices = ((mesh.max_vertices - 1) / 32) * 32;
+        } else {
+            return Err("a mesh shader whose minimum output count exceeds 32 KiB");
+        }
+    }
+    Ok(mesh)
+}
+
 impl<'a> Lower<'a> {
     fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
         let p = x.p;
@@ -2356,6 +2404,12 @@ impl<'a> Lower<'a> {
                 };
             }
             Input::Barycentric { kind, index } => return self.barycentric(kind, index),
+            // The Windows backend does not expose per-wave POPS collisions.
+            // Report no overlap: the title's POPS prologue then takes its
+            // ordinary path instead of waiting on a console packer.
+            Input::PopsIntrawaveCollision | Input::PopsCollisionWaveId => {
+                return Val::I32(self.s.m.i32(0));
+            }
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -3180,6 +3234,12 @@ impl<'a> Lower<'a> {
             Operand::Vector { reg, .. } => {
                 let v = inst.read(Reg::V(reg)).ok_or("an unread operand")?;
                 self.i32_of(v)
+            }
+            Operand::Const(239) => {
+                // GFX10's volatile POPS exiting-wave id. The host currently
+                // reports no POPS overlap (zero COLLISION_WAVEID), so this
+                // source is not observed by the shader's guarded wait loop.
+                Ok(self.s.m.i32(0))
             }
             Operand::Const(c) => crate::resource::inline(c)
                 .map(|x| self.s.m.i32(x))
@@ -4171,23 +4231,15 @@ impl<'a> Lower<'a> {
         // writes only vertex n and primitive n, so maxima past the lanes are
         // never reached: they come down to the lane count when the outputs
         // do not fit.
-        use super::container::{MESH_OUTPUT_LIMIT, mesh_output_bytes};
         let (outputs, prims) = (&self.s.outputs, &self.s.prims);
-        let fits = |m: super::shader::Mesh| {
-            mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
-        };
-        if !fits(mesh) {
-            mesh.max_vertices = mesh.max_vertices.min(threads);
-            mesh.max_primitives = mesh.max_primitives.min(threads);
-            // shortcut: outputs past the cap even at the lane count are
-            // still emitted with the lower maxima (drivers take them);
-            // refuse them here if one hangs.
-            // Experiment (`VICTORY_MESH_OUTPUT_STRICT=1`): they are refused.
-            if !fits(mesh) && std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some() {
-                return Err("a mesh shader whose outputs pass the host's 32 KiB");
-            }
-            self.s.mesh = Some(mesh);
-        }
+        mesh = mesh_counts_that_fit(
+            mesh,
+            threads,
+            outputs,
+            prims,
+            std::env::var_os("VICTORY_MESH_OUTPUT_STRICT").is_some(),
+        )?;
+        self.s.mesh = Some(mesh);
         let e = self.s.entry;
         let void = self.s.t.void;
         let (v, p) = (
@@ -11291,13 +11343,46 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{
+        Lowered, Numeric, Parts, buffer_format, half_shift, lower, mesh_counts_that_fit,
+    };
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn oversized_mesh_maxima_reduce_by_a_wave_and_guard_output_writes() {
+        use crate::emit::container::{MESH_OUTPUT_LIMIT, SigElement, mesh_output_bytes};
+
+        let element = |index, cols| SigElement {
+            name: "TEXCOORD".into(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(index),
+            col: 0,
+            cols,
+            usage: 0,
+            half: false,
+        };
+        let outputs: Vec<_> = (0..16)
+            .map(|i| element(i, 4))
+            .chain([element(16, 2)])
+            .collect();
+        let mesh = super::super::shader::Mesh {
+            max_vertices: 128,
+            max_primitives: 128,
+            topology: 2,
+        };
+        let fit = mesh_counts_that_fit(mesh, 128, &outputs, &[], false).unwrap();
+        assert_eq!((fit.max_vertices, fit.max_primitives), (96, 128));
+        assert!(mesh_output_bytes(&outputs, &[], fit.max_vertices, fit.max_primitives) <= MESH_OUTPUT_LIMIT);
+        assert!(mesh_counts_that_fit(mesh, 128, &outputs, &[], true).is_err());
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {

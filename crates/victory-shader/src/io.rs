@@ -66,6 +66,10 @@ pub enum Input {
     ThreadIdInGroup(u8),
     /// Compute: the thread-group info SGPR (wave index and count).
     GroupInfo,
+    /// PS: the per-quad intrawave POPS collision mask.
+    PopsIntrawaveCollision,
+    /// PS: COLLISION_WAVEID. The host currently supplies zero (no overlap).
+    PopsCollisionWaveId,
     /// Mesh: v5, the group id times the group size (read as uniform).
     MeshGroup,
     /// Mesh: s3, the wave's index in the group in bits 24-27.
@@ -204,10 +208,30 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             HwStage::Ps,
         ) => {
             // A pixel shader exports no parameters; `[]` never reaches `Unread`.
-            let loaded = ps_vgprs(*input_addr)
+            let mut loaded: Vec<(Reg, Input)> = ps_vgprs(*input_addr)
                 .into_iter()
                 .map(|(r, i)| (Reg::V(r), i))
                 .collect();
+            if has_pops_wait(p) {
+                // POPS arguments follow the title's user-data SGPR range.
+                // The Windows backend cannot observe rasterizer collisions,
+                // so the translated shader takes the documented no-overlap
+                // path by receiving a zero collision record.
+                let user_sgprs = native
+                    .layout
+                    .iter()
+                    .map(|param| {
+                        u32::from(native.stage.user_sgpr(param.user_data)) + param.sgprs
+                    })
+                    .max()
+                    .unwrap_or(0);
+                if let (Ok(intrawave), Ok(collision)) =
+                    (u8::try_from(user_sgprs), u8::try_from(user_sgprs + 1))
+                {
+                    loaded.push((Reg::S(intrawave), Input::PopsIntrawaveCollision));
+                    loaded.push((Reg::S(collision), Input::PopsCollisionWaveId));
+                }
+            }
             (loaded, &inputs[..], &[][..])
         }
         (StageIo::Vs { inputs, outputs }, HwStage::Vs) => {
@@ -464,6 +488,18 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
 }
 
 /// The pixel input VGPRs that `addr` enables, with their meaning.
+/// Whether the PS contains the inter-wave POPS wait loop. The source is
+/// GFX10's volatile `src_pops_exiting_wave_id` (operand code 239).
+fn has_pops_wait(p: &Program) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
+        matches!(
+            &inst.fields,
+            Fields::Sop { src, .. }
+                if src.iter().any(|op| matches!(op, Operand::Const(239)))
+        )
+    })
+}
+
 fn ps_vgprs(addr: u32) -> Vec<(u8, Input)> {
     let mut out = Vec::new();
     let mut next = 0u8;
@@ -604,7 +640,7 @@ impl Halves<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native::ExportPatch;
+    use crate::native::{ExportPatch, RootParam, RootType};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
@@ -628,6 +664,33 @@ mod tests {
             },
             code: vec![],
         }
+    }
+
+    #[test]
+    fn pops_inputs_follow_user_data_and_take_the_no_overlap_path() {
+        // Read s17/s18 and the GFX10 POPS exiting-wave source.
+        let p = program(&[
+            0xBE82_0311, // s_mov_b32 s2, s17
+            0xBE83_0312, // s_mov_b32 s3, s18
+            0x8102_04EF, // s_add_i32 s2, src_pops_exiting_wave_id, s4
+            S_ENDPGM,
+        ]);
+        assert!(has_pops_wait(&p));
+
+        let mut native = pixel(Vec::new(), 0);
+        native.layout = vec![RootParam {
+            root: RootType::Constants,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 16,
+            slot: 0,
+        }];
+        let io = raise(&p, &native).unwrap();
+        let s17 = p.inputs.iter().find(|i| i.0 == Reg::S(17)).unwrap().1;
+        let s18 = p.inputs.iter().find(|i| i.0 == Reg::S(18)).unwrap().1;
+        assert!(io.inputs.contains(&(s17, Input::PopsIntrawaveCollision)));
+        assert!(io.inputs.contains(&(s18, Input::PopsCollisionWaveId)));
     }
 
     const TEXCOORD: PsInput = PsInput {

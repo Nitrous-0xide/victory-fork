@@ -89,9 +89,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
             }
         }
     }
-    let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
-    for i in order {
+    for i in 0..elements.len() {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
         let rw = if input { used } else { !used & 0xf };

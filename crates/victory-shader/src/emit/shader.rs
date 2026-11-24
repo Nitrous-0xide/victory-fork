@@ -447,6 +447,12 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
+        // The console packs elements of different interpolation modes into one
+        // register; the DXIL validator wants a register to use one mode. The
+        // loads name their element by index, so only the rows move.
+        for list in [&mut self.inputs, &mut self.outputs, &mut self.prims] {
+            separate_interp_rows(list);
+        }
         // The clean-up, before anything is declared about the code: a
         // feature whose last use it removed must not be declared (the
         // validator compares the flags with what the code uses).
@@ -886,5 +892,29 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+/// Gives every register one interpolation mode: an element whose mode differs
+/// from the first one in its register moves to a register of its own.
+fn separate_interp_rows(list: &mut [SigElement]) {
+    let mut rows: Vec<u32> = list.iter().filter_map(|e| e.row).collect();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut next = rows.last().map_or(0, |r| r + 1);
+    for row in rows {
+        let mut modes: Vec<u8> = list
+            .iter()
+            .filter(|e| e.row == Some(row))
+            .map(|e| e.interp)
+            .collect();
+        modes.sort_unstable();
+        modes.dedup();
+        for &mode in modes.iter().skip(1) {
+            for e in list.iter_mut().filter(|e| e.row == Some(row) && e.interp == mode) {
+                e.row = Some(next);
+            }
+            next += 1;
+        }
     }
 }
