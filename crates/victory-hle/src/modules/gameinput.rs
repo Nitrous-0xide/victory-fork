@@ -1146,6 +1146,18 @@ mod host {
             self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
+            // A real pad can be connected while the player uses the keyboard:
+            // the stand-in pad is not created then, so its buttons are added
+            // to the first pad instead (the title's start screen listens to
+            // pad 0 and saw no keyboard input otherwise).
+            if slot == 0 && focused() {
+                for &(vk, button) in super::FALLBACK_BUTTONS.iter() {
+                    // SAFETY: plain query.
+                    if unsafe { GetAsyncKeyState(i32::from(vk)) } < 0 {
+                        pad.buttons |= button;
+                    }
+                }
+            }
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
