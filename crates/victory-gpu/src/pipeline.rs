@@ -97,6 +97,12 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// Microseconds the recording threads waited for host pipelines since the last present.
+pub(crate) static WAIT_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Shaders translated and the microseconds it took (for the log at the end of a batch).
+pub(crate) static TRANSLATE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -135,7 +141,10 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                let began = std::time::Instant::now();
                 let done = translate(&self.container);
+                TRANSLATE[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                TRANSLATE[1].fetch_add(began.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {

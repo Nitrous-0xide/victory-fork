@@ -82,6 +82,12 @@ struct Retired(#[allow(dead_code)] Box<dyn std::any::Any>);
 // reference-counted wrappers holding them, dropped once.
 unsafe impl Send for Retired {}
 
+/// When the last frame was presented, in [`now_ms`].
+static LAST_PRESENT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Per presented frame since the last log: ms since the previous present, ms waited for host pipelines.
+static FRAME_GAPS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
 /// Milliseconds since the first call.
 pub(crate) fn now_ms() -> u64 {
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
@@ -5780,6 +5786,12 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        {
+            let now = now_ms();
+            let gap = now.saturating_sub(LAST_PRESENT_MS.swap(now, Ordering::Relaxed));
+            let wait = crate::pipeline::WAIT_US.swap(0, Ordering::Relaxed) / 1000;
+            FRAME_GAPS.lock().unwrap_or_else(|e| e.into_inner()).push((gap, wait));
+        }
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
@@ -5942,6 +5954,20 @@ impl Meter {
                     per_frame(4) / 1e6,
                     per_frame(5),
                     per_frame(6) / 1e3
+                );
+            }
+            {
+                let mut gaps = std::mem::take(&mut *FRAME_GAPS.lock().unwrap_or_else(|e| e.into_inner()));
+                gaps.sort_unstable();
+                let at = |q: usize| gaps.get((gaps.len() * q / 100).min(gaps.len().saturating_sub(1))).map_or(0, |g| g.0);
+                let waited: u64 = gaps.iter().map(|g| g.1).sum();
+                let longest_wait = gaps.iter().map(|g| g.1).max().unwrap_or(0);
+                tracing::info!(
+                    "frame gaps over {} presents: p50 {} ms, p95 {} ms, max {} ms; recording threads waited {waited} ms for host pipelines in all, the most in one frame {longest_wait} ms",
+                    gaps.len(),
+                    at(50),
+                    at(95),
+                    at(100)
                 );
             }
             tracing::info!(

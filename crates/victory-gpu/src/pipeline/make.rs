@@ -194,6 +194,7 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
+    super::WAIT_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     let waited = started.elapsed().min(left);
     {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
@@ -340,6 +341,20 @@ fn drained() {
             loaded = LOADED.load(Ordering::Relaxed),
             started_early = EARLY.load(Ordering::Relaxed),
             "host pipelines all made"
+        );
+    }
+    {
+        let t = &super::library::TIMES;
+        let tr = &super::TRANSLATE;
+        let ms = |i: usize| t[i].load(Ordering::Relaxed) as f64 / 1e3;
+        tracing::info!(
+            translated = tr[0].load(Ordering::Relaxed),
+            translate_ms = tr[1].load(Ordering::Relaxed) as f64 / 1e3,
+            loads = t[0].load(Ordering::Relaxed),
+            load_ms = ms(1),
+            driver_compiles = t[2].load(Ordering::Relaxed),
+            compile_ms = ms(3),
+            "pipeline timing, run totals so far"
         );
     }
     super::library::save(false);

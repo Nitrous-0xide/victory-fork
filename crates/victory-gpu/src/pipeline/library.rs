@@ -67,6 +67,9 @@ pub fn use_pipeline_cache(dir: PathBuf) {
 pub(crate) static MADE: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static EARLY: AtomicU64 = AtomicU64::new(0);
+
+/// Loads, their microseconds, driver compiles, their microseconds (run totals).
+pub(crate) static TIMES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// For the memory lines: the bytes of the library's file, kept in memory
 /// while the library lives, and the bytes the last save wrote (a buffer of
 /// that size is made, filled and written every time pipelines were added,
@@ -526,6 +529,8 @@ pub(crate) fn pipeline(
         let _call = call("load", name);
         load(&library.library, PCWSTR(wide.as_ptr()))
     };
+    TIMES[0].fetch_add(1, Ordering::Relaxed);
+    TIMES[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     // The load read the library's file (see `trim`).
     LOADED_AT.store(crate::host::now_ms(), Ordering::Relaxed);
     TRIMMED.store(false, Ordering::Relaxed);
@@ -541,10 +546,13 @@ pub(crate) fn pipeline(
         Err(e) => e,
     };
     // Compiled outside any lock: compiles take up to seconds.
+    let compiled = std::time::Instant::now();
     let pso = {
         let _call = call("make", name);
         create()?
     };
+    TIMES[2].fetch_add(1, Ordering::Relaxed);
+    TIMES[3].fetch_add(compiled.elapsed().as_micros() as u64, Ordering::Relaxed);
     MADE.fetch_add(1, Ordering::Relaxed);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
