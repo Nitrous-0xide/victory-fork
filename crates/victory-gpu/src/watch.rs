@@ -862,16 +862,44 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
 /// does.
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+/// Counts the mapping changes ([`title_memory_remapping`]): odd while one is
+/// under way, so that a read which saw the same even number before and
+/// after it overlapped none.
+static REMAP_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
 pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        // Still under the lock: the count is even again before anyone reads.
+        REMAP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// The runtime is about to map, unmap or move physical pages of title
 /// memory: until what it returns is dropped, no read of title memory in
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    let guard = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    REMAP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Remapping(guard)
+}
+
+/// A stamp of the mapping for [`title_memory_unchanged`]: `None` while the
+/// runtime is changing it.
+pub(crate) fn title_memory_stamp() -> Option<u64> {
+    let epoch = REMAP_EPOCH.load(std::sync::atomic::Ordering::SeqCst);
+    (epoch % 2 == 0).then_some(epoch)
+}
+
+/// Whether no mapping change began or ended since `stamp` was taken: what
+/// a copy of title memory read between the two saw is what a read in place
+/// would have seen (for a copy through the kernel, which takes no lock).
+pub(crate) fn title_memory_unchanged(stamp: u64) -> bool {
+    REMAP_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == stamp
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -1517,5 +1545,28 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// A copy through the kernel is kept only if no change of mapping began
+    /// or ended while it was read: a stamp taken while a read in place holds
+    /// the mapping is current until a change of mapping, and none is taken
+    /// while it is being changed.
+    #[test]
+    fn a_stamp_is_stale_once_a_change_of_mapping_has_run() {
+        let stamp = {
+            let _reading = title_memory_reading();
+            let stamp = super::title_memory_stamp().expect("no change of mapping under a read");
+            assert!(super::title_memory_unchanged(stamp));
+            stamp
+        };
+        {
+            let _changing = title_memory_remapping();
+            assert!(super::title_memory_stamp().is_none(), "a copy may start during a change of mapping");
+            assert!(!super::title_memory_unchanged(stamp));
+        }
+        let _reading = title_memory_reading();
+        assert!(!super::title_memory_unchanged(stamp), "a copy across a change of mapping passed");
+        let fresh = super::title_memory_stamp().expect("the mapping is changing still");
+        assert_ne!(fresh, stamp);
     }
 }

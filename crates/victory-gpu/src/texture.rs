@@ -294,8 +294,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 }
 
 /// Whether a texture refresh that finds the runtime remapping title memory
-/// goes on without waiting for it (`VICTORY_TEXTURE_NO_WAIT=1`; off by
-/// default).
+/// goes on without waiting for it. On by default; `VICTORY_TEXTURE_WAIT=1`
+/// waits as before.
 ///
 /// A texture whose memory is all mapped is read in place, under a lock
 /// the runtime takes alone while it changes a mapping
@@ -314,10 +314,14 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
 ///
 /// What changes for the picture: a texture that arrives while the runtime
-/// is remapping may show a frame later. It never shows partly read.
+/// is remapping may show a frame later. It never shows partly read: the
+/// kernel's copy is kept only if no mapping change began or ended while it
+/// was read ([`crate::watch::title_memory_unchanged`]). The wait held the
+/// frame thread for hundreds of milliseconds per frame in the prologue
+/// (337 ms of a 378 ms refresh, run of the 1.6 fps release build).
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_WAIT").is_none_or(|v| v != "1"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -1041,14 +1045,20 @@ impl Staging {
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
     /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then nothing is taken and the texture
-    /// is looked at again at its next refresh (what was learnt about writes
-    /// to it is forgotten, so that it is not passed over as unwritten).
-    /// Returns the bytes read.
+    /// is not there at this moment. The read is kept only if no mapping
+    /// change overlapped it (checked before anything is hashed or detiled),
+    /// else nothing is taken and the texture is looked at again at its next
+    /// refresh (what was learnt about writes to it is forgotten, so that it
+    /// is not passed over as unwritten). Returns the bytes read.
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
+        let Some(stamp) = crate::watch::title_memory_stamp() else {
+            UNLOCKED[1].fetch_add(1, Relaxed);
+            last.asked = 0;
+            return 0;
+        };
         let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
+            if !crate::host::read_into(self.memory, read) || !crate::watch::title_memory_unchanged(stamp) {
                 return false;
             }
             let hash = blake3::hash(read);
