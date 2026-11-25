@@ -1528,6 +1528,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     }
     let (buffer, data, capacity) = match take_pooled(total) {
         Some(p) => {
+            // A fresh buffer holds zeros, and levels never detiled (levels on
+            // demand) rely on them: a reused one is zeroed as the new one would be.
+            // SAFETY: the mapping of a pooled buffer of at least `total` bytes, no GPU use pending.
+            unsafe { p.data.write_bytes(0, total as usize) };
             UPLOAD_BUFFERS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (p.buffer, p.data, p.size)
         }
@@ -1574,6 +1578,25 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 #[cfg(test)]
 mod upload_pool_tests {
     use super::{POOL_BYTES, pool_fit, pool_room};
+
+    /// Per call of `resource::texture_layout`, which every new staging buffer
+    /// makes. Run by hand: `cargo test ... bench_layout -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_layout() {
+        for (width, height) in [(16u32, 4u32), (2048, 2048)] {
+            let words: [u32; 14] = [3, 0, 0, 0, width, 0, height, 65537, 10, 1, 0, 256, 3_145_728, 0];
+            // SAFETY: fourteen words are a resource description (56 bytes).
+            let desc: crate::resource::ResourceDesc = unsafe { std::mem::transmute(words) };
+            let n = 200;
+            let t = std::time::Instant::now();
+            let mut some = 0;
+            for _ in 0..n {
+                some += std::hint::black_box(crate::resource::texture_layout(&desc)).is_some() as u32;
+            }
+            println!("{width}x{height}: texture_layout {:.1} us per call ({some}/{n} with a layout)", t.elapsed().as_secs_f64() * 1e6 / n as f64);
+        }
+    }
 
     /// A pooled upload buffer is taken only if it holds the staging buffer
     /// and is at most twice its size: the first one of the pool that does.
