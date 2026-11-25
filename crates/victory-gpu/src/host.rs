@@ -5972,6 +5972,10 @@ impl Meter {
                 );
             }
             {
+                let [made, taken] = crate::texture::upload_buffers_taken();
+                tracing::info!(
+                    "upload buffers of textures since the last log: {made} made, {taken} taken from the pool"
+                );
                 let [looked, refreshed, staged] = heap_parts;
                 tracing::info!(
                     "heap buffer pass per frame: {looked:.1} ms looking at views and spans, {refreshed:.1} ms refreshing copies, {staged:.1} ms staging textures (the last second; the parts add up to the heap buffers pass)"

@@ -45,6 +45,8 @@ pub(crate) struct Staging {
     mips: u32,
     /// The staging buffer's bytes (counted in `STAGED` while it lives).
     bytes: u64,
+    /// The upload buffer's size: at least `bytes` (a pooled one may be larger).
+    capacity: u64,
     memory: *const u8,
     last: Mutex<Last>,
     /// Whether the staging buffer was detiled since a submitted list last
@@ -405,7 +407,89 @@ impl Drop for Staging {
         use std::sync::atomic::Ordering::Relaxed;
         STAGED[0].fetch_sub(1, Relaxed);
         STAGED[1].fetch_sub(self.bytes, Relaxed);
+        // The upload buffer goes back to the pool once no submission that
+        // ran can still copy from it (`host::retire`).
+        crate::host::retire(Returned {
+            buffer: Some(self.buffer.clone()),
+            data: self.data,
+            size: self.capacity,
+        });
     }
+}
+
+/// Upload buffers of staging buffers let go, kept to be given to the next
+/// staging buffer that fits (`take_pooled`), up to `POOL_BYTES`. Creating
+/// one is a committed upload heap of the texture's size, zeroed by the
+/// driver; a texture let go as idle and sampled again made one anew.
+static POOL: Mutex<Vec<Pooled>> = Mutex::new(Vec::new());
+
+/// Bytes the pool may hold.
+const POOL_BYTES: u64 = 256 << 20;
+
+/// Upload buffers made by `staging` and given out from the pool.
+static UPLOAD_BUFFERS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// For the heap pass line: upload buffers made, and taken from the pool, since the last call.
+pub(crate) fn upload_buffers_taken() -> [u64; 2] {
+    [0, 1].map(|i| UPLOAD_BUFFERS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+struct Pooled {
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    size: u64,
+}
+
+// SAFETY: a free-threaded D3D12 object and its persistent mapping, given
+// to one staging buffer at a time.
+unsafe impl Send for Pooled {}
+
+/// An upload buffer of a dropped staging buffer, waiting for the
+/// submissions that ran to finish. Dropped, it goes to the pool if the
+/// pool has room, else it is released.
+struct Returned {
+    buffer: Option<ID3D12Resource>,
+    data: *mut u8,
+    size: u64,
+}
+
+// SAFETY: as for `Pooled`.
+unsafe impl Send for Returned {}
+
+impl Drop for Returned {
+    fn drop(&mut self) {
+        let Some(buffer) = self.buffer.take() else {
+            return;
+        };
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let sizes: Vec<u64> = pool.iter().map(|p| p.size).collect();
+        if pool_room(&sizes, self.size) {
+            pool.push(Pooled { buffer, data: self.data, size: self.size });
+        }
+    }
+}
+
+/// Whether an upload buffer of `size` bytes fits the pool holding buffers
+/// of `held` bytes.
+fn pool_room(held: &[u64], size: u64) -> bool {
+    held.iter().sum::<u64>() + size <= POOL_BYTES
+}
+
+/// Which pooled buffer of `sizes` a staging buffer of `size` bytes takes:
+/// one of at least `size` and no more than twice that (the first found).
+fn pool_fit(sizes: &[u64], size: u64) -> Option<usize> {
+    sizes
+        .iter()
+        .position(|&p| p >= size && p <= size.saturating_mul(2))
+}
+
+/// A pooled upload buffer of at least `size` bytes and no more than twice
+/// that, if there is one.
+fn take_pooled(size: u64) -> Option<Pooled> {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let sizes: Vec<u64> = pool.iter().map(|p| p.size).collect();
+    let at = pool_fit(&sizes, size)?;
+    Some(pool.swap_remove(at))
 }
 
 /// For the memory line: staging buffers alive, their bytes, and how many
@@ -1442,7 +1526,17 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
             Some(&mut total),
         );
     }
-    let (buffer, data) = host.upload_buffer(total)?;
+    let (buffer, data, capacity) = match take_pooled(total) {
+        Some(p) => {
+            UPLOAD_BUFFERS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (p.buffer, p.data, p.size)
+        }
+        None => {
+            let (buffer, data) = host.upload_buffer(total)?;
+            UPLOAD_BUFFERS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (buffer, data, total)
+        }
+    };
     crate::host::name(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
@@ -1462,6 +1556,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         bytes: total,
+        capacity,
         memory,
         last: Mutex::default(),
         dirty: std::sync::atomic::AtomicBool::new(true),
@@ -1477,8 +1572,78 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 }
 
 #[cfg(test)]
+mod upload_pool_tests {
+    use super::{POOL_BYTES, pool_fit, pool_room};
+
+    /// A pooled upload buffer is taken only if it holds the staging buffer
+    /// and is at most twice its size: the first one of the pool that does.
+    #[test]
+    fn a_pooled_buffer_is_taken_when_it_fits_within_twice_the_size() {
+        assert_eq!(pool_fit(&[], 10), None);
+        assert_eq!(pool_fit(&[100], 60), Some(0), "100 holds 60, within twice");
+        assert_eq!(pool_fit(&[100], 40), None, "100 is more than twice 40");
+        assert_eq!(pool_fit(&[100], 200), None, "100 does not hold 200");
+        assert_eq!(pool_fit(&[50, 100], 60), Some(1), "50 does not hold 60");
+        assert_eq!(pool_fit(&[100, 80], 60), Some(0), "the first that fits");
+    }
+
+    /// The pool keeps buffers up to `POOL_BYTES` and lets the rest go.
+    #[test]
+    fn the_pool_keeps_buffers_up_to_its_bytes() {
+        assert!(pool_room(&[], POOL_BYTES));
+        assert!(!pool_room(&[POOL_BYTES], 1));
+        assert!(pool_room(&[1 << 20], 2 << 20));
+        assert!(!pool_room(&[POOL_BYTES - 1, 1], 1));
+    }
+}
+
+#[cfg(test)]
 mod mapped_bytes_tests {
-    use super::mapped_bytes;
+    use super::{committed, mapped_bytes, readable};
+
+    /// Per call, in microseconds: the per-block probe `mapped_bytes` used
+    /// to make, `mapped_bytes` now, and `committed` over the whole memory
+    /// (`staged`). Run by hand: `cargo test ... bench_ -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_mapped_checks() {
+        use windows_sys::Win32::System::Memory::*;
+        for mb in [1usize, 4, 16, 64] {
+            let size = mb << 20;
+            // SAFETY: a private reservation of our own, read only here.
+            unsafe {
+                let base = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+                assert!(!base.is_null());
+                base.write_bytes(0x5a, size);
+                let blocks = size / (64 << 10);
+                let n = 50;
+                let t = std::time::Instant::now();
+                for _ in 0..n {
+                    let mut there = 0;
+                    for b in 0..blocks {
+                        if readable(base as usize + b * (64 << 10), 1, true).0 == 1 {
+                            there += 1;
+                        }
+                    }
+                    std::hint::black_box(there);
+                }
+                let old = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+                let t = std::time::Instant::now();
+                for _ in 0..n {
+                    std::hint::black_box(mapped_bytes(base, size));
+                }
+                let new = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+                let t = std::time::Instant::now();
+                for _ in 0..n {
+                    std::hint::black_box(committed(base, size));
+                }
+                let whole = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+                println!("{mb:>3} MB: per-block probes {old:>9.0} us, mapped_bytes {new:>9.0} us, committed (whole) {whole:>9.0} us");
+                assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            }
+        }
+    }
+
 
     /// What `mapped_bytes` counts: whole 64 KiB blocks of the range that are
     /// mapped, cut to the range. Also across the 256 blocks one batch asks
