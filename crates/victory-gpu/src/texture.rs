@@ -1280,6 +1280,39 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     (there, of)
 }
 
+/// For each address, whether its page can be read: what `readable(at, 1, true)`
+/// says for one page. The working set is asked for up to 256 pages at once,
+/// so the blocks of a texture cost one query per 256 rather than one each.
+fn readable_at(addresses: &[usize]) -> Vec<bool> {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const KERNEL_PAGE: usize = 4096;
+    let mut out = Vec::with_capacity(addresses.len());
+    // SAFETY: plain data.
+    let mut info: [PSAPI_WORKING_SET_EX_INFORMATION; 256] = unsafe { std::mem::zeroed() };
+    for batch in addresses.chunks(info.len()) {
+        for (entry, &at) in info.iter_mut().zip(batch) {
+            entry.VirtualAddress = ((at / KERNEL_PAGE) * KERNEL_PAGE) as *mut _;
+        }
+        // SAFETY: `batch.len()` entries of the size given; our own process.
+        let asked = unsafe {
+            K32QueryWorkingSetEx(
+                GetCurrentProcess(),
+                info.as_mut_ptr().cast(),
+                (batch.len() * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32,
+            )
+        } != 0;
+        for (entry, &at) in info.iter().zip(batch) {
+            // SAFETY: plain data the query filled in.
+            let valid = asked && unsafe { entry.VirtualAttributes.Flags } & 1 != 0;
+            let page = ((at / KERNEL_PAGE) * KERNEL_PAGE) as *const u8;
+            let mut byte = [0u8];
+            out.push(valid || crate::host::read_into(page, &mut byte));
+        }
+    }
+    out
+}
+
 fn committed_by_query(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
@@ -1329,14 +1362,18 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         // textures "uploaded in part" kept the pass over the heap's views at
         // 90-160 ms a frame (run 81). `VICTORY_MAPPED_BY_PAGE=1`: by page.
         const BLOCK: usize = 64 << 10;
-        let mut there = 0u64;
+        let mut spans = Vec::new();
         let mut block = start & !(BLOCK - 1);
         while block < end {
-            let (lo, hi) = (block.max(start), block.saturating_add(BLOCK).min(end));
-            if readable(lo, 1, true).0 == 1 {
+            spans.push((block.max(start), block.saturating_add(BLOCK).min(end)));
+            block = block.saturating_add(BLOCK);
+        }
+        let probes: Vec<usize> = spans.iter().map(|&(lo, _)| lo).collect();
+        let mut there = 0u64;
+        for ((lo, hi), ok) in spans.into_iter().zip(readable_at(&probes)) {
+            if ok {
                 there += (hi - lo) as u64;
             }
-            block = block.saturating_add(BLOCK);
         }
         return there;
     }
@@ -1437,6 +1474,36 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod mapped_bytes_tests {
+    use super::mapped_bytes;
+
+    /// What `mapped_bytes` counts: whole 64 KiB blocks of the range that are
+    /// mapped, cut to the range. Also across the 256 blocks one batch asks
+    /// for at once.
+    #[test]
+    fn mapped_bytes_counts_the_mapped_blocks_of_the_range() {
+        use windows_sys::Win32::System::Memory::*;
+        const SIZE: usize = 0x120_0000; // 288 blocks
+        // SAFETY: a private reservation of our own, only read here.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), SIZE, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            assert_eq!(VirtualAlloc(base.cast(), SIZE, MEM_COMMIT, PAGE_READWRITE), base.cast());
+            base.write_bytes(0x5a, SIZE);
+            assert_eq!(mapped_bytes(base, SIZE), SIZE as u64);
+            // Block 260 (past the first batch) taken away.
+            assert_ne!(VirtualFree(base.add(260 * 0x1_0000).cast(), 0x1_0000, MEM_DECOMMIT), 0);
+            assert_eq!(mapped_bytes(base, SIZE), (SIZE - 0x1_0000) as u64);
+            // A range inside two blocks, one mapped (0x8000 of it) and one not.
+            assert_eq!(mapped_bytes(base.add(259 * 0x1_0000 + 0x8000), 0x1_0000), 0x8000);
+            // A range wholly inside the taken-away block.
+            assert_eq!(mapped_bytes(base.add(260 * 0x1_0000 + 0x1000), 0x1000), 0);
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 }
 
 #[cfg(test)]
