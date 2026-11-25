@@ -5876,6 +5876,7 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        let heap_parts = [0, 1, 2].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -5971,11 +5972,9 @@ impl Meter {
                 );
             }
             {
-                let [looked, refreshed, staged] = [0, 1, 2].map(|i| {
-                    crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames
-                });
+                let [looked, refreshed, staged] = heap_parts;
                 tracing::info!(
-                    "heap buffer pass per frame: {looked:.1} ms looking at views and spans, {refreshed:.1} ms refreshing copies, {staged:.1} ms staging textures"
+                    "heap buffer pass per frame: {looked:.1} ms looking at views and spans, {refreshed:.1} ms refreshing copies, {staged:.1} ms staging textures (the last second; the parts add up to the heap buffers pass)"
                 );
             }
             tracing::info!(
